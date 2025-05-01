@@ -1,0 +1,10 @@
+# Git repository configuration
+GIT_REPO=""
+GIT_USERNAME=""
+GIT_PASSWORD=""
+
+# Docker repository configuration
+DOCKER_REPO=""
+DOCKER_USERNAME=""
+DOCKER_PASSWORD="" 
+ 
