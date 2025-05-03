@@ -27,6 +27,7 @@
 #    - Generates smart commit messages based on changed files
 #
 # 3. Docker Operations:
+#    - Uses Docker BuildKit for efficient, modern builds
 #    - Builds Docker image with specified version
 #    - Tags image with both version and 'latest'
 #    - Pushes images to registry using credentials from .deployenv
@@ -45,10 +46,15 @@
 #    - Provides clear error messages
 #
 # 6. Security:
+#    - Advanced sensitive data detection with pattern recognition
+#    - Trufflehog integration for superior secret detection
+#    - Alternative deep scanning when Trufflehog is unavailable
+#    - Displays line numbers for pinpointing sensitive data
 #    - Uses credentials from .deployenv file
 #    - Supports secure git and Docker authentication
 #    - Recommends adding .deployenv to .gitignore
 #    - Scans for sensitive files and credentials before commit
+#    - Excludes itself (deploy.sh) from sensitive data scanning
 #
 # =====================================================
 # Configuration Instructions
@@ -114,15 +120,18 @@ print_error() {
 # Function to get user confirmation
 get_confirmation() {
     local prompt=$1
-    while true; do
+    local response=""
+    
+    echo -e "${BLUE}[INPUT]${NC} $prompt (y/n): \c"
+    read -r response
+    
+    while [[ ! "$response" =~ ^[YyNn]$ ]]; do
+        echo "Please answer yes or no."
         echo -e "${BLUE}[INPUT]${NC} $prompt (y/n): \c"
         read -r response
-        case $response in
-            [Yy]* ) return 0;;
-            [Nn]* ) return 1;;
-            * ) echo "Please answer yes or no.";;
-        esac
     done
+    
+    [[ "$response" =~ ^[Yy]$ ]] && return 0 || return 1
 }
 
 # Function to get version increment type
@@ -180,6 +189,8 @@ check_sensitive_files() {
         "credentials.json"
         "config.json"
         "secrets.json"
+        "service_account.json"
+        "service-account.json"
         "*.pem"
         "*.key"
         "*.crt"
@@ -189,28 +200,167 @@ check_sensitive_files() {
         "*.pfx"
     )
     
+    # More sophisticated regex patterns for sensitive data
     local sensitive_patterns=(
-        "password"
-        "secret"
-        "key"
-        "token"
-        "credential"
-        "api_key"
-        "access_key"
-        "secret_key"
+        # AWS keys
+        "[A-Z0-9]{20}"
+        "AKIA[0-9A-Z]{16}"
+        # API keys and tokens (common formats) - improved to reduce false positives
+        "(?<![\w._-])[a-zA-Z0-9_-]{32,45}(?![\w._-])"
+        # Private keys
+        "-----BEGIN.*PRIVATE KEY-----"
+        # JWT tokens
+        "eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}"
+        # Database connection strings
+        "postgres://.*:.*@.*:[0-9]{4,5}/.*"
+        "mysql://.*:.*@.*:[0-9]{4,5}/.*"
+        "mongodb://.*:.*@.*:[0-9]{4,5}/.*"
+        # Authorization headers
+        "Authorization: Bearer [a-zA-Z0-9_.-]+"
+        "Authorization: Basic [a-zA-Z0-9+/=]+"
+        # Generic passwords and secrets
+        "password['\"]?\s*[:=]\s*['\"][^'\"]{8,}['\"]"
+        "secret['\"]?\s*[:=]\s*['\"][^'\"]{8,}['\"]"
+        "key['\"]?\s*[:=]\s*['\"][^'\"]{16,}['\"]"
     )
     
+    # Additional entropy-based patterns for the manual scan
+    local entropy_patterns=(
+        # High entropy strings (likely keys, tokens, passwords)
+        "[a-zA-Z0-9+/]{32,}"
+        "[a-zA-Z0-9]{32,}"
+        # GitHub tokens and OAuth patterns
+        "gh[pousr]_[A-Za-z0-9_]{20,}"
+        "gho_[A-Za-z0-9_]{36,}"
+        # Google API keys
+        "AIza[0-9A-Za-z_-]{35}"
+        # Stripe API keys
+        "sk_live_[0-9a-zA-Z]{24}"
+        "pk_live_[0-9a-zA-Z]{24}"
+        # AWS Account ID
+        "[0-9]{12}"
+        # Generic hex keys
+        "[0-9a-fA-F]{32,}"
+    )
+    
+    # Script name to exclude from checks (the current script)
+    local script_name=$(basename "$0")
+    
     print_status "Checking for sensitive files and credentials..."
+    print_status "Excluding the current script ($script_name) from checks..."
+    
+    # Check if trufflehog is installed
+    if command -v trufflehog &> /dev/null; then
+        print_status "Running TruffleHog to scan for secrets..."
+        # Exclude the current script from trufflehog scanning
+        trufflehog_output=$(trufflehog filesystem --no-update --only-verified --exclude "$script_name" . 2>/dev/null || echo "")
+        
+        if [ -n "$trufflehog_output" ]; then
+            print_warning "TruffleHog found potential secrets:"
+            echo "$trufflehog_output"
+            
+            if ! get_confirmation "Do you want to continue with the build despite TruffleHog finding secrets?"; then
+                print_error "Build cancelled due to secrets found by TruffleHog"
+                exit 1
+            else
+                print_warning "Continuing despite TruffleHog findings"
+            fi
+        else
+            print_status "TruffleHog scan completed - no secrets found."
+        fi
+    else
+        print_warning "TruffleHog not installed. Using alternative deep scanning method."
+        
+        # Run alternative deep scan using native tools
+        print_status "Running alternative deep scan for secrets..."
+        
+        # Get all text files that aren't ignored by git, excluding the current script
+        text_files=$(git ls-files --cached --others --exclude-standard | grep -v "\.jpg$\|\.png$\|\.gif$\|\.zip$\|\.tar$\|\.gz$\|\.pdf$\|$script_name$")
+        
+        # Create a temporary file to store scan results
+        scan_results=$(mktemp)
+        
+        # Function to check file for entropy patterns
+        scan_file_for_patterns() {
+            local file=$1
+            local patterns=("${!2}")
+            
+            # Skip if this is the current script
+            if [[ "$(basename "$file")" == "$script_name" ]]; then
+                return
+            fi
+            
+            for pattern in "${patterns[@]}"; do
+                # Use grep with line numbers (-n flag)
+                matches=$(grep -n -E "$pattern" "$file" 2>/dev/null)
+                if [ -n "$matches" ]; then
+                    echo "File: $file" >> "$scan_results"
+                    echo "Pattern: $pattern" >> "$scan_results"
+                    echo "Match (line:content):" >> "$scan_results"
+                    echo "$matches" >> "$scan_results"
+                    echo "---" >> "$scan_results"
+                fi
+            done
+        }
+        
+        # Process each file
+        for file in $text_files; do
+            # Skip binary files and the current script
+            if file "$file" | grep -q "binary" || [[ "$(basename "$file")" == "$script_name" ]]; then
+                continue
+            fi
+            
+            # Check for sensitive patterns
+            scan_file_for_patterns "$file" sensitive_patterns[@]
+            
+            # Check for entropy patterns
+            scan_file_for_patterns "$file" entropy_patterns[@]
+            
+            # Check for Base64 encoded secrets (lines that look like base64 and are long enough)
+            base64_matches=$(grep -n -E "^[A-Za-z0-9+/]{40,}={0,2}$" "$file" 2>/dev/null)
+            if [ -n "$base64_matches" ]; then
+                echo "File: $file" >> "$scan_results"
+                echo "Pattern: Base64 encoded secret" >> "$scan_results"
+                echo "Match (line:content):" >> "$scan_results"
+                echo "$base64_matches" >> "$scan_results"
+                echo "---" >> "$scan_results"
+            fi
+        done
+        
+        # Check if we found any results
+        if [ -s "$scan_results" ]; then
+            print_warning "Alternative scan found potential secrets:"
+            cat "$scan_results"
+            
+            if ! get_confirmation "Do you want to continue with the build despite finding potential secrets?"; then
+                rm "$scan_results"
+                print_error "Build cancelled due to potential secrets found"
+                exit 1
+            else
+                print_warning "Continuing despite finding potential secrets"
+            fi
+        else
+            print_status "Alternative scan completed - no secrets found."
+        fi
+        
+        # Clean up temporary file
+        rm "$scan_results"
+    fi
     
     # Check for sensitive files
     for pattern in "${sensitive_files[@]}"; do
-        # Find files matching pattern, excluding .git directory
-        found_files=$(find . -name "$pattern" | grep -v "^./.git/")
+        # Find files matching pattern, excluding .git directory and the current script
+        found_files=$(find . -name "$pattern" | grep -v "^./.git/" | grep -v "/$script_name$")
         if [ -n "$found_files" ]; then
             # Filter out files that are in .gitignore
             non_ignored_files=""
             for file in $found_files; do
                 relative_path=${file#./}
+                # Skip the current script
+                if [[ "$(basename "$relative_path")" == "$script_name" ]]; then
+                    continue
+                fi
+                
                 if ! git check-ignore -q "$relative_path"; then
                     non_ignored_files+="$file"$'\n'
                 fi
@@ -223,51 +373,64 @@ check_sensitive_files() {
                 
                 for file in $non_ignored_files; do
                     relative_path=${file#./}
+                    # Skip if this is the current script
+                    if [[ "$(basename "$relative_path")" == "$script_name" ]]; then
+                        continue
+                    fi
+                    
                     if ! get_confirmation "Do you want to add $relative_path to .gitignore?"; then
-                        print_error "Commit cancelled due to sensitive files not being ignored"
-                        exit 1
+                        if ! get_confirmation "Do you want to continue with the build despite not ignoring this sensitive file?"; then
+                            print_error "Build cancelled due to sensitive files not being ignored"
+                            exit 1
+                        else
+                            print_warning "Continuing with sensitive file $relative_path not ignored"
+                        fi
                     else
                         echo "$relative_path" >> .gitignore
                         print_status "Added $relative_path to .gitignore"
                     fi
                 done
-                
-                if ! get_confirmation "Do you want to continue despite finding sensitive files?"; then
-                    print_error "Commit cancelled due to sensitive files"
-                    exit 1
-                fi
             fi
         fi
     done
     
-    # Check for sensitive patterns in files
+    # Check for sensitive patterns in files using advanced regex
     for pattern in "${sensitive_patterns[@]}"; do
-        # First get list of all non-ignored files
-        non_ignored_files=$(git ls-files --others --exclude-standard)
+        # Limit to non-ignored files, excluding binaries, common non-text files, and the current script
+        non_ignored_files=$(git ls-files --cached --others --exclude-standard | grep -v "\.jpg$\|\.png$\|\.gif$\|\.zip$\|\.tar$\|\.gz$\|$script_name$")
         
         if [ -n "$non_ignored_files" ]; then
-            # Search for patterns only in non-ignored files
-            found_matches=$(grep -r --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=venv -i "$pattern" $non_ignored_files 2>/dev/null)
+            # Use grep with regex pattern (extended regex) and line numbers (-n flag)
+            found_matches=$(grep -n -E -r --include="$(echo $non_ignored_files | tr ' ' '\n' | paste -sd ',' -)" "$pattern" . 2>/dev/null || echo "")
             
             if [ -n "$found_matches" ]; then
-                print_warning "Found potential credentials matching pattern: $pattern"
-                echo "Matches found in:"
-                echo "$found_matches" | cut -d: -f1 | sort -u
+                # Filter out matches from the current script
+                filtered_matches=$(echo "$found_matches" | grep -v "^./$script_name:")
                 
-                for file in $(echo "$found_matches" | cut -d: -f1 | sort -u); do
-                    relative_path=${file#./}
-                    if ! get_confirmation "Do you want to add $relative_path to .gitignore?"; then
-                        print_error "Commit cancelled due to sensitive content not being ignored"
-                        exit 1
-                    else
-                        echo "$relative_path" >> .gitignore
-                        print_status "Added $relative_path to .gitignore"
-                    fi
-                done
-                
-                if ! get_confirmation "Do you want to continue despite finding potential credentials?"; then
-                    print_error "Commit cancelled due to potential credentials"
-                    exit 1
+                if [ -n "$filtered_matches" ]; then
+                    print_warning "Found potential sensitive data matching pattern: $pattern"
+                    echo "Matches found in (file:line:content):"
+                    echo "$filtered_matches"
+                    
+                    for file in $(echo "$filtered_matches" | cut -d: -f1 | sort -u); do
+                        relative_path=${file#./}
+                        # Skip if this is the current script
+                        if [[ "$(basename "$relative_path")" == "$script_name" ]]; then
+                            continue
+                        fi
+                        
+                        if ! get_confirmation "Do you want to add $relative_path to .gitignore?"; then
+                            if ! get_confirmation "Do you want to continue with the build despite not ignoring this file with sensitive content?"; then
+                                print_error "Build cancelled due to files with sensitive content not being ignored"
+                                exit 1
+                            else
+                                print_warning "Continuing with file containing sensitive content $relative_path not ignored"
+                            fi
+                        else
+                            echo "$relative_path" >> .gitignore
+                            print_status "Added $relative_path to .gitignore"
+                        fi
+                    done
                 fi
             fi
         fi
@@ -412,9 +575,12 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# Enable Docker BuildKit
+export DOCKER_BUILDKIT=1
+
 # Build the Docker image
-print_status "Building Docker image..."
-docker build -t "$DOCKER_REPO:$DOCKER_TAG" .
+print_status "Building Docker image with BuildKit..."
+docker build --progress=plain -t "$DOCKER_REPO:$DOCKER_TAG" .
 if [ $? -ne 0 ]; then
     print_error "Docker build failed"
     exit 1
