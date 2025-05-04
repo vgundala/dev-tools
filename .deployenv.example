@@ -1,10 +1,10 @@
-# Git repository configuration
-GIT_REPO=""
-GIT_USERNAME=""
-GIT_PASSWORD=""
-
 # Docker repository configuration
-DOCKER_REPO=""
-DOCKER_USERNAME=""
-DOCKER_PASSWORD="" 
+DOCKER_USERNAME=testuser
+DOCKER_PASSWORD=testpass
+DOCKER_REPO=testrepo
+
+# Git repository configuration
+GIT_USERNAME=testuser
+GIT_PASSWORD=testpass
+GIT_REPO=testrepo 
  
